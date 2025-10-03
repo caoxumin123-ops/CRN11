@@ -242,7 +242,7 @@ class DetNuscEvaluator():
 
         for sample_id, det in enumerate(mmcv.track_iter_progress(results)):
             boxes, scores, labels = det
-
+            
             order = np.argsort(scores)[::-1]
             order = order[:500]
 
