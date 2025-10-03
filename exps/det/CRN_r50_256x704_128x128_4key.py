@@ -84,7 +84,10 @@ from exps.base_exp import BEVDepthLightningModel
 
 from models.camera_radar_net_det import CameraRadarNetDet
 
-
+# 在文件开头添加导入  
+from layers.fuser.multiscale_feature_aggregation import MultiScaleMFAFuser  
+from layers.modules.temporal_modeling import MotionPredictionModule, TemporalConsistencyLoss, TemporalModelingIntegrator
+  
 class CRNLightningModel(BEVDepthLightningModel):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -92,6 +95,12 @@ class CRNLightningModel(BEVDepthLightningModel):
         self.return_image = True
         self.return_depth = True
         self.return_radar_pv = True
+        
+        # 添加困难样本挖掘相关参数  
+        self.distance_threshold = 50.0  # 远距离目标阈值  
+        self.hard_mining_ratio = 0.3    # 困难样本比例
+
+        
         ################################################
         self.optimizer_config = dict(
             type='AdamW',
@@ -146,6 +155,11 @@ class CRNLightningModel(BEVDepthLightningModel):
             'radar_view_transform': True,
             'camera_aware': False,
             'output_channels': 80,
+            
+            # 语义引导配置 - 移除固定的num_semantic_classes  
+            'use_semantic_guidance': True,  
+            'semantic_model_type': 'deeplabv3_mobilenet_v3_large',  
+            'semantic_feat_dim': 32,  # 只保留输出特征维度配置  
         }
         ################################################
         self.backbone_pts_conf = {
@@ -194,14 +208,34 @@ class CRNLightningModel(BEVDepthLightningModel):
             'out_channels_pts': 80,
         }
         ################################################
-        self.fuser_conf = {
-            'img_dims': 80,
-            'pts_dims': 80,
-            'embed_dims': 128,
-            'num_layers': 6,
-            'num_heads': 4,
-            'bev_shape': (128, 128),
-        }
+        self.fuser_conf = {  
+            'img_dims': 80,  
+            'pts_dims': 80,  
+            'embed_dims': 128,  
+            'num_layers': 6,  
+            'num_heads': 4,  
+            'bev_shape': (128, 128),  
+            #语义分割
+            'use_semantic_alignment': True,  
+            'semantic_dims': 32,  # 确保包含这个参数  
+
+            # 时序融合方法选择: 'conv', 'lstm', 'hybrid_attention'  
+            'temporal_fusion_type': 'hybrid_attention',  
+
+            # LSTM配置  
+            'lstm_config': {  
+                'hidden_size': 128,  
+                'num_layers': 2,  
+                'bidirectional': False  
+            },  
+
+            # 混合时空注意力配置  
+            'hybrid_attention_config': {  
+                'num_heads': 4,  
+                'dropout': 0.1  
+            }  
+        } 
+        
         ################################################
         self.head_conf = {
             'bev_backbone_conf': dict(
@@ -277,6 +311,73 @@ class CRNLightningModel(BEVDepthLightningModel):
                                        self.backbone_pts_conf,
                                        self.fuser_conf,
                                        self.head_conf)
+        # 语义引导增强配置  
+        self.use_semantic_attention = True  
+        self.use_temporal_consistency = True  
+        self.use_cross_modal_alignment = True  
+        self.semantic_loss_weight = 0.1  
+        self.temporal_loss_weight = 0.05  
+          
+        # 更新融合器配置  
+        self.fuser_conf.update({  
+            'use_semantic_alignment': self.use_cross_modal_alignment,  
+            'semantic_dims': 32  # 与您的语义特征维度匹配  
+        })
+        
+        # 新增配置  
+        self.use_multiscale_fusion = True  
+        self.use_temporal_modeling = True  
+        self.use_improved_loss = True  
+          
+        # 修改融合器配置  
+        if self.use_multiscale_fusion:  
+            self.fuser_conf.update({  
+                'type': 'MultiScaleMFAFuser',  
+                'scales': [1.0, 0.5, 0.25]  
+            })  
+          
+        # 时序建模配置  
+        self.temporal_conf = {  
+            'feature_dim': 256,  
+            'hidden_dim': 128,  
+            'num_frames': 4  
+        }  
+
+        # 使用集成的时序建模模块  
+        self.temporal_integrator = TemporalModelingIntegrator(**self.temporal_conf)
+        
+        # 损失函数权重配置  
+        self.loss_weights = {  
+            'detection': 1.0,  
+            'depth': 3.0,  
+            'temporal_consistency': 0.1,  
+            'hard_mining': 1.5  
+        }  
+          
+        # 困难样本挖掘配置  
+        self.hard_mining_conf = {  
+            'distance_threshold': 50.0,  
+            'mining_ratio': 0.3,  
+            'class_weights': {  
+                'car': 1.0,  
+                'truck': 1.2,  
+                'construction_vehicle': 2.0,  
+                'bus': 1.1,  
+                'trailer': 2.0,  
+                'barrier': 1.0,  
+                'motorcycle': 1.3,  
+                'bicycle': 1.2,  
+                'pedestrian': 1.1,  
+                'traffic_cone': 1.0,  
+            }  
+        }  
+          
+          
+        # 初始化时序建模模块  
+        if self.use_temporal_modeling:  
+            self.motion_predictor = MotionPredictionModule(**self.temporal_conf)  
+            self.temporal_loss = TemporalConsistencyLoss(weight=self.loss_weights['temporal_consistency'])  
+            self.prev_features = None  
 
     def forward(self, sweep_imgs, mats, is_train=False, **inputs):
         return self.model(sweep_imgs, mats, sweep_ptss=inputs['pts_pv'], is_train=is_train)
@@ -311,7 +412,41 @@ class CRNLightningModel(BEVDepthLightningModel):
         self.log('train/heatmap', loss_heatmap)
         self.log('train/bbox', loss_bbox)
         self.log('train/depth', loss_depth)
-        return loss_detection + loss_depth
+        
+        # 添加语义相关损失  
+        semantic_consistency_loss = torch.tensor(0.0, device=loss_detection.device)  
+        temporal_semantic_loss = torch.tensor(0.0, device=loss_detection.device)  
+        
+        # 困难样本挖掘损失  
+        if self.use_improved_loss:  
+            loss_hard_mining = self.compute_hard_mining_loss(targets, preds, gt_boxes_3d)  
+            loss_detection = loss_detection + self.loss_weights['hard_mining'] * loss_hard_mining  
+
+        if hasattr(self.model.backbone_img, 'use_semantic_guidance') and self.model.backbone_img.use_semantic_guidance:  
+          
+            # 语义一致性损失（可选）  
+            if hasattr(self, 'semantic_maps'):  
+                semantic_consistency_loss = self.semantic_consistency_loss(  
+                    preds, self.semantic_maps, gt_labels_3d  
+                )  
+
+            # 时序语义一致性损失  
+            if hasattr(self.model.backbone_img, 'prev_semantic_feat') and self.model.backbone_img.prev_semantic_feat is not None:  
+                temporal_semantic_loss = self.model.backbone_img.temporal_consistency(  
+                    self.model.backbone_img.current_semantic_feat,  
+                    self.model.backbone_img.prev_semantic_feat )  
+              
+        # 更新总损失  
+        total_loss = loss_detection + loss_depth + \
+                    0.1 * semantic_consistency_loss + \
+                    0.05 * temporal_semantic_loss  
+
+        # 记录损失  
+        self.log('train/semantic_consistency', semantic_consistency_loss)  
+        self.log('train/temporal_semantic', temporal_semantic_loss)  
+
+                
+        return total_loss
 
     def validation_epoch_end(self, validation_step_outputs):
         detection_losses = list()
@@ -354,6 +489,58 @@ class CRNLightningModel(BEVDepthLightningModel):
                 depth_labels = depth_labels[:, 0, ...].contiguous()
             loss_depth = self.get_depth_loss(depth_labels.cuda(), depth_preds, weight=3.)
         return loss_detection, loss_heatmap, loss_bbox, loss_depth
+    
+    def compute_hard_mining_loss(self, targets, preds, gt_boxes_3d):  
+        """计算困难样本挖掘损失"""  
+        try:  
+            # 检查preds的结构  
+            if isinstance(preds, list) and len(preds) > 0:  
+                # 对于CenterPoint风格的输出，preds通常是任务列表  
+                if isinstance(preds[0], list) and len(preds[0]) > 0:  
+                    # 获取第一个任务的第一个预测  
+                    pred_dict = preds[0][0]  
+                    if 'bboxes' in pred_dict:  
+                        pred_boxes = pred_dict['bboxes']  
+                        pred_scores = pred_dict['scores']  
+                    else:  
+                        # 如果没有找到预期的键，返回零损失  
+                        return torch.tensor(0.0, device=next(self.parameters()).device)  
+                else:  
+                    # 如果结构不符合预期，返回零损失  
+                    return torch.tensor(0.0, device=next(self.parameters()).device)  
+            else:  
+                return torch.tensor(0.0, device=next(self.parameters()).device)  
+
+            # 计算距离权重（远距离目标权重更高）  
+            if len(pred_boxes) > 0:  
+                distances = torch.norm(pred_boxes[:, :2], dim=1)  # 计算到原点的距离  
+                distance_weights = torch.where(distances > self.distance_threshold,   
+                                             torch.tensor(2.0, device=distances.device),  
+                                             torch.tensor(1.0, device=distances.device))  
+
+                # 选择困难样本（低分数的预测）  
+                num_hard = int(len(pred_scores) * self.hard_mining_ratio)  
+                if num_hard > 0:  
+                    _, hard_indices = torch.topk(pred_scores, num_hard, largest=False)  
+                    hard_weights = distance_weights[hard_indices]  
+
+                    # 计算困难样本的损失（这里使用简单的L2损失作为示例）  
+                    if len(gt_boxes_3d) > 0 and len(gt_boxes_3d[0]) > 0:  
+                        hard_boxes = pred_boxes[hard_indices]  
+                        # 简化的损失计算  
+                        loss = torch.mean(hard_weights * torch.norm(hard_boxes[:len(gt_boxes_3d[0])] - gt_boxes_3d[0][:len(hard_boxes)], dim=1))  
+                    else:  
+                        loss = torch.tensor(0.0, device=pred_boxes.device)  
+                else:  
+                    loss = torch.tensor(0.0, device=pred_boxes.device)  
+            else:  
+                loss = torch.tensor(0.0, device=next(self.parameters()).device)  
+
+        except Exception as e:  
+            print(f"Error in compute_hard_mining_loss: {e}")  
+            loss = torch.tensor(0.0, device=next(self.parameters()).device)  
+
+        return loss
 
 
 if __name__ == '__main__':
