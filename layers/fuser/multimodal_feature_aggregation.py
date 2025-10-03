@@ -7,12 +7,63 @@ from mmcv.cnn.bricks.transformer import build_feedforward_network, build_positio
 from mmcv.runner import auto_fp16
 
 from ..modules.multimodal_deformable_cross_attention import DeformableCrossAttention
+from .lstm_temporal_fuser import LSTMTemporalFuser  
 
+class CrossModalSemanticAlignment(nn.Module):  
+    def __init__(self, img_dims, pts_dims, semantic_dims, embed_dims):  
+        super().__init__()  
+        self.img_semantic_proj = nn.Linear(semantic_dims, img_dims)  
+        self.pts_semantic_proj = nn.Linear(semantic_dims, pts_dims)  
+          
+    def forward(self, img_feat, pts_feat, semantic_feat):  
+        # 将语义特征投影到对应模态的维度  
+        img_semantic = self.img_semantic_proj(semantic_feat)  
+        pts_semantic = self.pts_semantic_proj(semantic_feat)  
+          
+        # 语义引导的特征增强  
+        aligned_img = img_feat + img_semantic  
+        aligned_pts = pts_feat + pts_semantic  
+          
+        return aligned_img, aligned_pts  
 
-class MFAFuser(nn.Module):
-    def __init__(self, num_sweeps=4, img_dims=80, pts_dims=128, embed_dims=256,
-                 num_layers=6, num_heads=4, bev_shape=(128, 128)):
-        super(MFAFuser, self).__init__()
+class MFAFuser(nn.Module):  
+    def __init__(self, num_sweeps=4, img_dims=80, pts_dims=128, embed_dims=256,  
+                 num_layers=6, num_heads=4, bev_shape=(128, 128),   
+                 temporal_fusion_type='hybrid_attention', lstm_config=None,   
+                 use_semantic_alignment =True,semantic_dims=32,
+                 hybrid_attention_config=None, **kwargs):  
+        super(MFAFuser, self).__init__()  
+          
+        self.temporal_fusion_type = temporal_fusion_type  
+        self.lstm_config = lstm_config or {}  
+        self.hybrid_attention_config = hybrid_attention_config or {}  
+         # 根据配置选择不同的时序融合方法  
+        if temporal_fusion_type == 'conv':  
+            # 原有的卷积融合  
+            self.reduce_conv = nn.Sequential(  
+                nn.Conv2d(embed_dims*num_sweeps, embed_dims,   
+                         kernel_size=3, stride=1, padding=1, bias=False),  
+                nn.BatchNorm2d(embed_dims),  
+                nn.ReLU(inplace=True),  
+            )  
+        elif temporal_fusion_type == 'lstm':  
+            # LSTM时序融合  
+            from .lstm_temporal_fuser import LSTMTemporalFuser  
+            self.temporal_fuser = LSTMTemporalFuser(  
+                embed_dims=embed_dims,   
+                num_sweeps=num_sweeps,  
+                **self.lstm_config  
+            )  
+        elif temporal_fusion_type == 'hybrid_attention':  
+            # 混合时空注意力融合  
+            from .hybrid_temporal_spatial_fuser import HybridTemporalSpatialFuser  
+            self.temporal_fuser = HybridTemporalSpatialFuser(  
+                embed_dims=embed_dims,  
+                num_sweeps=num_sweeps,  
+                **self.hybrid_attention_config  
+            )  
+        else:  
+            raise ValueError(f"Unsupported temporal_fusion_type: {temporal_fusion_type}")
 
         self.num_modalities = 2
         self.use_cams_embeds = False
@@ -79,19 +130,12 @@ class MFAFuser(nn.Module):
                 ),
             )
 
-        self.reduce_conv = nn.Sequential(
-            nn.Conv2d(embed_dims*num_sweeps,
-                      embed_dims,
-                      kernel_size=3,
-                      stride=1,
-                      padding=1,
-                      bias=False),
-            nn.BatchNorm2d(embed_dims),
-            nn.ReLU(inplace=True),
-        )
 
         self.init_weights()
-
+        if use_semantic_alignment:  
+            self.cross_modal_alignment = CrossModalSemanticAlignment(  
+                img_dims, pts_dims, semantic_dims, embed_dims)
+            
     def init_weights(self):
         """Initialize the transformer weights."""
         for p in self.parameters():
@@ -232,4 +276,7 @@ class MFAFuser(nn.Module):
                     feats[:, sweep_index, self.img_dims:self.img_dims+self.pts_dims])
                 ret_feature_list.append(feature_map)
 
-        return self.reduce_conv(torch.cat(ret_feature_list, 1)).float(), self.times
+        if self.temporal_fusion_type == 'conv':  
+            return self.reduce_conv(torch.cat(ret_feature_list, 1)).float(), self.times  
+        else:  
+            return self.temporal_fuser(ret_feature_list).float(), self.times
