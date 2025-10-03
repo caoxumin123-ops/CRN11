@@ -1,7 +1,7 @@
 import mmcv
 
 from models.base_bev_depth import BaseBEVDepth
-from layers.backbones.rvt_lss_fpn import RVTLSSFPN
+from layers.backbones.rvt_lss_fpn import RVTLSSFPN, SemanticGuidedRVTLSSFPN
 from layers.backbones.pts_backbone import PtsBackbone
 from layers.fuser.multimodal_feature_aggregation import MFAFuser
 from layers.heads.bev_depth_head_det import BEVDepthHead
@@ -24,7 +24,17 @@ class CameraRadarNetDet(BaseBEVDepth):
 
     def __init__(self, backbone_img_conf, backbone_pts_conf, fuser_conf, head_conf):
         super(BaseBEVDepth, self).__init__()
-        self.backbone_img = RVTLSSFPN(**backbone_img_conf)
+        
+        # 根据配置选择使用语义引导版本还是原版本  
+        if backbone_img_conf.get('use_semantic_guidance', False):  
+            self.backbone_img = SemanticGuidedRVTLSSFPN(**backbone_img_conf)  
+
+            # 验证语义模块集成  
+            if hasattr(self.backbone_img, '_validate_semantic_integration'):  
+                self.backbone_img._validate_semantic_integration()  
+        else:  
+            self.backbone_img = RVTLSSFPN(**backbone_img_conf) 
+        
         self.backbone_pts = PtsBackbone(**backbone_pts_conf)
         self.fuser = MFAFuser(**fuser_conf)
         self.head = BEVDepthHead(**head_conf)
